@@ -132,24 +132,45 @@ class ImpervaFilesHandler:
 
     def decrypt_and_unpack_file(self, file_name, file_content):
         logging.info("Unpacking and decrypting file {}".format(file_name))
+        
         file_splitted = file_content.split(b"|==|\n")
-        file_header = file_splitted[0].decode("utf-8")
-        file_data = file_splitted[1]
-        file_encryption_flag = file_header.find("key:")
+        if len(file_splitted) >= 2:
+            file_header = file_splitted[0].decode("utf-8")
+            file_data = file_splitted[1]
+            file_encryption_flag = file_header.find("key:")
+        else:
+            file_header = ""
+            file_data = file_content
+            file_encryption_flag = -1
+        
         events_arr = []
+        events_data = None
+        
         if file_encryption_flag == -1:
             try:
                 events_data = zlib.decompressobj().decompress(file_data).decode("utf-8")
             except Exception as err:
-                if 'while decompressing data: incorrect header check' in err.args[0]:
+                # Zlib hatası (incorrect header vb.) alınırsa plain text dene
+                try:
                     events_data = file_data.decode("utf-8")
-                else:
-                    logging.error("Error during decompressing and decoding the file with error message {}.".format(err))                   
+                except Exception as decode_err:
+                    logging.error(f"Error decoding data as plain text: {decode_err}. Original zlib error: {err}")
+                    events_data = None
+
         if events_data is not None:
             for line in events_data.splitlines():
                 if "CEF" in line:
-                    event_message = self.parse_cef(line)
-                    events_arr.append(event_message)
+                    try:
+                        event_message = self.parse_cef(line)
+                        events_arr.append(event_message)
+                    except Exception as e:
+                        logging.error(f"Error parsing CEF line: {e}")
+                elif line.strip().startswith("{"):
+                    # JSON log işleme
+                    event_message = self.parse_json_log(line)
+                    if event_message:
+                        events_arr.append(event_message)
+                        
         for chunk in self.gen_chunks_to_object(events_arr, chunksize=1000):
             self.sentinel.post_data(json.dumps(chunk), len(chunk), file_name)
     
@@ -157,10 +178,13 @@ class ImpervaFilesHandler:
         rx = r'([^=\s\|]+)?=((?:[\\]=|[^=])+)(?:\s|$)'
         parsed_cef = {"EventVendor": "Imperva", "EventProduct": "Incapsula", "EventType": "SIEMintegration"}
         header_array = cef_raw.split('|')
-        parsed_cef["Device Version"]=header_array[3]
-        parsed_cef["Signature"]=header_array[4]
-        parsed_cef["Attack Name"]=header_array[5]
-        parsed_cef["Attack Severity"]=header_array[6]
+        
+        if len(header_array) > 6:
+            parsed_cef["Device Version"]=header_array[3]
+            parsed_cef["Signature"]=header_array[4]
+            parsed_cef["Attack Name"]=header_array[5]
+            parsed_cef["Attack Severity"]=header_array[6]
+        
         for key,val in re.findall(rx, cef_raw):
             if val.startswith('"') and val.endswith('"'):
                 val = val[1:-1]
@@ -187,6 +211,36 @@ class ImpervaFilesHandler:
             parsed_cef['EventGeneratedTime'] = ""
 
         return parsed_cef
+
+    def parse_json_log(self, json_raw):
+        """Helper to parse JSON formatted logs (e.g. Audit Trail)"""
+        try:
+            parsed_json = json.loads(json_raw)
+            # Sentinel için zorunlu alanlar
+            parsed_json["EventVendor"] = "Imperva"
+            parsed_json["EventProduct"] = "Incapsula"
+            
+            # Log tipini belirlemeye çalış, yoksa generic ver
+            if "dataset" in parsed_json:
+                 parsed_json["EventType"] = parsed_json["dataset"]
+            else:
+                 parsed_json["EventType"] = "GeneralLog"
+
+            # Zaman damgasını işle
+            if "@timestamp" in parsed_json:
+                try:
+                    # Timestamp genellikle ms cinsinden gelir
+                    ts = int(parsed_json["@timestamp"]) / 1000.0
+                    parsed_json['EventGeneratedTime'] = datetime.datetime.utcfromtimestamp(ts).isoformat()
+                except:
+                    parsed_json['EventGeneratedTime'] = datetime.datetime.utcnow().isoformat()
+            else:
+                parsed_json['EventGeneratedTime'] = datetime.datetime.utcnow().isoformat()
+            
+            return parsed_json
+        except Exception as e:
+            logging.error(f"Error parsing JSON line: {e}")
+            return None
                 
     def gen_chunks_to_object(self, object, chunksize=100):
         chunk = []
